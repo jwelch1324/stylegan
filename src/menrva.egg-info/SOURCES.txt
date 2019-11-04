@@ -1,0 +1,6 @@
+setup.py
+src/menrva.egg-info/PKG-INFO
+src/menrva.egg-info/SOURCES.txt
+src/menrva.egg-info/dependency_links.txt
+src/menrva.egg-info/requires.txt
+src/menrva.egg-info/top_level.txt
