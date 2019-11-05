@@ -131,6 +131,81 @@ class LatentDisentanglingNetwork(nn.Module):
         return z
 
 
+class LayerEpilog(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    
+
+class StyleGANSynthesizer(nn.Module):
+    def __init__(self, 
+        output_resolution = 256, # The final output resolution of the generated image -- best to use a power of two
+        dlatent_size = 512, # Dimensionality of the disentangled latent noise space W
+        num_channels = 3,  # Number of output channels for the generated signal
+        fmap_base = 8192, # Multiplier for the number of feature maps
+        fmap_decay = 1.0, # log2 feature map reduction when doubling the resolution
+        fmap_max = 512, # Maximum number of feature maps allowed in any layer.
+        use_styles = True, # Enable the Style Inputs?
+        const_input_layer = True, # Is the first layer of the generator a learned constant?
+        use_noise = True, # Enable noise inputs?
+        randomize_noise = True, # True = Randomize Noise inputs every time, False = read noise inputs from variables
+        activation = 'lrelu', # Activation function, can be 'relu' or 'lrelu'
+        use_wscale = True, # Enabled the Equalized Learning Rate?
+        use_pixel_norm = False, # Enable pixelwise feature vector normalization?
+        use_instance_norm = True, # Enable Instance Normalization?
+        dtype = 'float32',
+        fused_scale = 'auto', # True = fused convolution + scaling, False = separate ops, 'auto' = decide automatically
+        blur_filter = [1,2,1], # Low-pass filter to apply when resampling, None = no filtering
+        structure = 'auto', # 'fixed' = no progressive growing, 'linear' = human-readable, 'recursive' = efficient, 'auto' = select automatically,
+        **_kwargs
+    ):
+        resolution_log2 = int(np.log2(output_resolution))
+        assert resolution == 2**resolution_log2 and resolution >= 4
+        def nf(stage): return min(int(fmap_base/(2.0**(stage*fmap_decay))),fmap_max)
+        def blur(x): return blur2d(x, blur_filter) if blur_filter else x
+        if structure == 'auto': 
+            self.structure = 'recursive' #Default to recursive
+        else:
+            self.structure = structure
+        
+        self.act = {'relu': nn.ReLU, 'lrelu': nn.LeakyReLU(0.01)}[activation]
+
+        num_layers = resolution_log2 * 2 - 2
+        num_styles = num_layers if use_styles else 1
+
+        self.use_noise = use_noise
+        self.use_wscale = use_wscale
+        self.use_pixel_norm = use_pixel_norm
+        self.use_instance_norm = use_instance_norm
+        self.fused_scale = fused_scale
+        self.blur_filter = blur_filter
+
+        self.contexts = resolution_log2 + 1 - 3
+
+        self.const_tensor = nn.Parameter(torch.ones(1,nf(1),4,4))
+        self.noise_scaling_factors = nn.ParameterList([nn.Parameter(torch.ones(nf(i+1))) for i in range(num_layers)]
+        self.bias_tensors = nn.ParameterList([nn.Parameter(torch.zeros(nf()) for i in range(self.contexts)])
+        
+
+    #Convert this into a layer epilog module.
+    def layer_epilog(self, x, layer_idx, context_idx, noise=None):
+        if self.use_noise:
+            if noise is None:
+                noise = torch.randn((x.shape[0], 1, x.shape[1], x.shape[2]),dtype=x.dtype)
+            else:
+                noise = noise.to(x.dtype)
+            # Add the noise with the channel wise scaling
+            x = x + noise * self.noise_scaling_factors[layer_idx].reshape(1,-1,1,1).to(x.dtype)
+        
+        # Apply the learned bias vectors
+        x = x + self.bias_tensors[context_idx]
+
+            
+
+    def forward(self, w_latents, noise=None):
+        if noise is not None:
+            assert len(noise) == self.num_layers
+
 
 class StyleGANGenerator(nn.Module):
     def __init__(self,
