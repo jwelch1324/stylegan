@@ -30,6 +30,53 @@ def pixel_norm(x,epsilon=1e-8):
     rsqx = 1.0/torch.sqrt(torch.mean(torch.pow(x,2),dim=1,keepdims=True) + epsilon)
     return (x*rsqx)
 
+def instance_norm(x, epsilon=1e-8):
+    orig_dtype = x.dtype
+    x = x.to(torch.float32)
+    x -= x.mean(dim=(2,3), keepdim=True)
+    epsilon = torch.tensor(epsilon).to(x.dtype)
+    rsqx = 1.0/torch.sqrt(torch.mean(torch.pow(x,2.0),dim=(2,3),keepdim=True)+epsilon)
+    x *= rsqx
+    x = x.to(orig_dtype)
+    return x
+
+
+
+def blur_2d_layer(kernel_size=3, sigma=2, channels=3):
+    # Create a x, y coordinate grid of shape (kernel_size, kernel_size, 2)
+    x_coord = torch.arange(kernel_size)
+    x_grid = x_coord.repeat(kernel_size).view(kernel_size, kernel_size)
+    y_grid = x_grid.t()
+    xy_grid = torch.stack([x_grid, y_grid], dim=-1).float()
+
+    mean = (kernel_size - 1)/2.
+    variance = sigma**2.
+
+    # Calculate the 2-dimensional gaussian kernel which is
+    # the product of two gaussian distributions for two different
+    # variables (in this case called x and y)
+    gaussian_kernel = (1./(2.*np.pi*variance)) *\
+                      torch.exp(
+                          -torch.sum((xy_grid - mean)**2., dim=-1) /\
+                          (2*variance)
+                      )
+
+    # Make sure sum of values in gaussian kernel equals 1.
+    gaussian_kernel = gaussian_kernel / torch.sum(gaussian_kernel)
+
+    # Reshape to 2d depthwise convolutional weight
+    gaussian_kernel = gaussian_kernel.view(1, 1, kernel_size, kernel_size)
+    gaussian_kernel = gaussian_kernel.repeat(channels, 1, 1, 1)
+
+    gaussian_filter = nn.Conv2d(in_channels=channels, out_channels=channels,
+                                kernel_size=kernel_size, groups=channels, padding=1, bias=False)
+
+    gaussian_filter.weight.data = gaussian_kernel
+    gaussian_filter.weight.requires_grad = False
+    
+    return gaussian_filter
+
+
 class Dense(nn.Module):
     def __init__(self,
         in_channels,
@@ -126,21 +173,154 @@ class LatentDisentanglingNetwork(nn.Module):
 
         #Broadcast if requested
         if self.dlatent_broadcast is not None:
-            z=z.unsqueeze(-1).repeat(1,self.dlatent_broadcast,1).reshape(z.shape[0],self.dlatent_broadcast,self.latent_size)
+            z = z.unsqueeze(-1).repeat(1,self.dlatent_broadcast,1).reshape(z.shape[0],self.dlatent_broadcast,self.latent_size)
 
         return z
 
 
 class LayerEpilog(nn.Module):
-    def __init__(self):
+    def __init__(self,
+        fmap_dim,
+        dlatent_dim,
+        lrmul, # Learning Rate Multiplier
+        activation,
+        use_pixel_norm,
+        use_instance_norm,
+        use_styles
+    ):
         super().__init__()
 
-    
+        self.act = {'relu': nn.ReLU(), 'lrelu': nn.LeakyReLU(0.01)}[activation]
+        self.bias = nn.Parameter(torch.zeros(fmap_dim))
+        self.noise_scaling_factors = nn.Parameter(torch.zeros(fmap_dim))# These are the learned feature wise noise scaling parameters
+        self.use_pixel_norm = use_pixel_norm
+        self.use_instance_norm = use_instance_norm
+        self.use_styles = use_styles
+        self.lrmul = lrmul
+
+        if self.use_styles:
+            self.style_mod_layer = LayerStyleMod(dlatent_dim, fmap_dim)
+        else:
+            self.style_mod_layer = None
+
+    def forward(self, x, dlatent, use_noise, noise=None):
+        if use_noise:
+            if noise is None:
+                noise = torch.randn((x.shape[0], 1, x.shape[2], x.shape[3]),dtype=x.dtype).to(x.device)#2d
+            else:
+                noise = noise.to(x.dtype).to(x.device)
+            # Add the noise with the channel wise scaling
+            x = x + noise * self.noise_scaling_factors.reshape(1,-1,1,1).to(x.dtype)#2d
+        
+        #Apply the bias
+        if len(x.shape) == 2:
+            x = x + (self.bias * self.lrmul)
+        else:
+            x = x + (self.bias.reshape((1,-1,1,1)) * self.lrmul) #This will broadcast the bias value across the entire channel dimension #2d
+        
+        #Apply the nonlinearity 
+        x = self.act(x)
+
+        if self.use_pixel_norm:
+            x = pixel_norm(x)
+        if self.use_instance_norm:
+            x = instance_norm(x)
+        if self.use_styles:
+            x = self.style_mod_layer(x, dlatent)
+            
+        return x
+
+class LayerStyleMod(nn.Module):
+    def __init__(self,
+        dlatent_dim, #Dimensionality of the dlatent space
+        layer_fmaps, #The number of feature maps for the layer this style is applied on
+    ):
+        super().__init__()
+
+        self.dense = Dense(dlatent_dim,2*layer_fmaps,gain=1)
+
+    def forward(self, x, dlatent):
+        style = self.dense(dlatent)
+        style = style.reshape([-1,2,x.shape[1]] + [1] * (len(x.shape) -2))
+        # Apply the adaptive instance norm transform -- x should have been instance normed prior to this
+        return x*(style[:,0] + 1) + style[:,1]
+
+
+
+
+class Block(nn.Module):
+    def __init__(self,
+        block_resolution, #log2 resolution of this block
+        fmaps_base, # Multiplier for the number of feature maps
+        dlatent_dim, # The Dimensionality of the W space 
+        activation,
+        use_pixel_norm,
+        use_instance_norm,
+        use_styles
+    ):
+        super().__init__()
+        def nf(stage): return min(int(fmaps_base/(2.0**(stage*1.0))),512)
+        def calc_padding(hout,hin,dilation,kernel,stride): return int(np.floor((stride*(hout-1)-hin+dilation*(kernel-1)+1)/2))
+
+        self.block_resolution = block_resolution
+        
+
+        self.epilogs = nn.ModuleList([
+            LayerEpilog(
+                nf(self.block_resolution-1),
+                dlatent_dim,
+                1.0,
+                activation,
+                use_pixel_norm,
+                use_instance_norm,
+                use_styles
+            ),
+            LayerEpilog(
+                nf(self.block_resolution-1),
+                dlatent_dim,
+                1.0,
+                activation,
+                use_pixel_norm,
+                use_instance_norm,
+                use_styles
+            )
+        ])
+
+        self.upscale_conv = nn.ConvTranspose2d(
+            in_channels = nf(self.block_resolution-2),
+            out_channels = nf(self.block_resolution-1),
+            kernel_size=3,
+            stride = 2,
+            padding = 1,
+            output_padding = 1,
+            bias=False #The bias term is handled in the Layer Epilogs
+        )
+
+        self.out_conv = nn.Conv2d(
+            in_channels = nf(self.block_resolution-1),
+            out_channels = nf(self.block_resolution-1),
+            kernel_size=3,
+            stride = 1,
+            padding = calc_padding(2**self.block_resolution, 2**self.block_resolution,1,3,1),
+            bias=False #The bias term is handled in the LayerEpilog
+        )
+
+        #The gaussian blur that is applied after the upscale to help mitigate checkerboard effects
+        self.blur_layer = blur_2d_layer(3,1,nf(self.block_resolution-1))
+
+    def forward(self, x, dlatent, use_noise, noise0=None, noise1=None):
+        # Upscale and blur the sample
+        x = self.epilogs[0](self.blur_layer(self.upscale_conv(x)), dlatent, use_noise, noise0)
+        # Apply second conv
+        x = self.epilogs[1](self.out_conv(x), dlatent, use_noise, noise1)
+        return x
+
+
 
 class StyleGANSynthesizer(nn.Module):
     def __init__(self, 
         output_resolution = 256, # The final output resolution of the generated image -- best to use a power of two
-        dlatent_size = 512, # Dimensionality of the disentangled latent noise space W
+        dlatent_dim = 512, # Dimensionality of the disentangled latent noise space W
         num_channels = 3,  # Number of output channels for the generated signal
         fmap_base = 8192, # Multiplier for the number of feature maps
         fmap_decay = 1.0, # log2 feature map reduction when doubling the resolution
@@ -153,58 +333,124 @@ class StyleGANSynthesizer(nn.Module):
         use_wscale = True, # Enabled the Equalized Learning Rate?
         use_pixel_norm = False, # Enable pixelwise feature vector normalization?
         use_instance_norm = True, # Enable Instance Normalization?
-        dtype = 'float32',
+        dtype = torch.float32,
         fused_scale = 'auto', # True = fused convolution + scaling, False = separate ops, 'auto' = decide automatically
         blur_filter = [1,2,1], # Low-pass filter to apply when resampling, None = no filtering
         structure = 'auto', # 'fixed' = no progressive growing, 'linear' = human-readable, 'recursive' = efficient, 'auto' = select automatically,
         **_kwargs
     ):
+        super().__init__()
         resolution_log2 = int(np.log2(output_resolution))
-        assert resolution == 2**resolution_log2 and resolution >= 4
+        assert output_resolution == 2**resolution_log2 and output_resolution >= 4
         def nf(stage): return min(int(fmap_base/(2.0**(stage*fmap_decay))),fmap_max)
         def blur(x): return blur2d(x, blur_filter) if blur_filter else x
+        
+        #Calculates the output shape of the convolution operations
+        def conv_out_size(s_in, padding, dilation, kernel, stride): return int(np.floor(((s_in+2*padding-dilation*(kernel-1)-1)/stride) + 1))
+        def calc_padding(hout,hin,dilation,kernel,stride): return int(np.floor((stride*(hout-1)-hin+dilation*(kernel-1)+1)/2))
         if structure == 'auto': 
-            self.structure = 'recursive' #Default to recursive
+            self.structure = 'fixed' #Default to fixed for the moment
         else:
             self.structure = structure
         
         self.act = {'relu': nn.ReLU, 'lrelu': nn.LeakyReLU(0.01)}[activation]
 
-        num_layers = resolution_log2 * 2 - 2
-        num_styles = num_layers if use_styles else 1
+        self.num_layers = resolution_log2 * 2 - 2
+        num_styles = self.num_layers if use_styles else 1
 
         self.use_noise = use_noise
         self.use_wscale = use_wscale
+        self.use_styles = use_styles
         self.use_pixel_norm = use_pixel_norm
         self.use_instance_norm = use_instance_norm
         self.fused_scale = fused_scale
         self.blur_filter = blur_filter
+        self.tensor_dtype = dtype
 
         self.contexts = resolution_log2 + 1 - 3
 
-        self.const_tensor = nn.Parameter(torch.ones(1,nf(1),4,4))
-        self.noise_scaling_factors = nn.ParameterList([nn.Parameter(torch.ones(nf(i+1))) for i in range(num_layers)]
-        self.bias_tensors = nn.ParameterList([nn.Parameter(torch.zeros(nf()) for i in range(self.contexts)])
-        
+        self.const_tensor = nn.Parameter(torch.ones(1,nf(1),4,4)) #The learned starting const tensor
 
-    #Convert this into a layer epilog module.
-    def layer_epilog(self, x, layer_idx, context_idx, noise=None):
-        if self.use_noise:
-            if noise is None:
-                noise = torch.randn((x.shape[0], 1, x.shape[1], x.shape[2]),dtype=x.dtype)
-            else:
-                noise = noise.to(x.dtype)
-            # Add the noise with the channel wise scaling
-            x = x + noise * self.noise_scaling_factors[layer_idx].reshape(1,-1,1,1).to(x.dtype)
-        
-        # Apply the learned bias vectors
-        x = x + self.bias_tensors[context_idx]
+        # Early Layers
+        self.const_layer_epilog = LayerEpilog(
+                nf(1),
+                dlatent_dim,
+                1.0,
+                activation,
+                use_pixel_norm,
+                use_instance_norm,
+                use_styles
+        )            
+        self.conv_4x4 = nn.Conv2d(
+            nf(1),
+            nf(1),
+            kernel_size = 3,
+            stride = 1,
+            padding = calc_padding(4,4,1,3,1),
+            bias = False
+        )
+        self.conv_4x4_epilog = LayerEpilog(
+            nf(1),
+            dlatent_dim,
+            1.0,
+            activation,
+            use_pixel_norm,
+            use_instance_norm,
+            use_styles
+        )
 
-            
+        blocks = []
+        if self.structure == 'fixed':
+            for res in range(3, resolution_log2 + 1):
+                blocks.append(Block(
+                    block_resolution = res, #log2 resolution of this block
+                    fmaps_base = fmap_base, # Multiplier for the number of feature maps
+                    dlatent_dim = dlatent_dim, # The Dimensionality of the W space 
+                    activation = activation,
+                    use_pixel_norm = self.use_pixel_norm,
+                    use_instance_norm = self.use_instance_norm,
+                    use_styles = self.use_styles
+                ))
+
+            self.body = nn.ModuleList(blocks)
+            #The final convolutional layer to output the expected number of channels
+            self.to_final_shape = nn.Conv2d(
+                nf(resolution_log2 - 1),
+                num_channels,
+                kernel_size=1,
+                stride=1,
+                padding=0
+            )
+        else:
+            raise NotImplementedError()
+        
 
     def forward(self, w_latents, noise=None):
+        #w_latents should have shape [B,num_layers,dlatent_dim]
         if noise is not None:
-            assert len(noise) == self.num_layers
+            assert len(noise) == self.num_layers #Make sure we have a noise vector for each expected layer
+        else:
+            noise = [None] * self.num_layers #Create a list of None noises to pass into the layers
+
+        # Early Layers
+        x = self.const_layer_epilog(self.const_tensor.to(self.tensor_dtype).repeat((w_latents.shape[0],1,1,1)),w_latents[:,0],self.use_noise,noise[0])
+        x = self.conv_4x4_epilog(self.conv_4x4(x),w_latents[:,1],self.use_noise,noise[1])
+
+        if self.structure == 'fixed':
+            #Apply the main body of the network
+            c = 2
+            for block in self.body:
+                print(c)
+                x = block(x,w_latents[:,c],self.use_noise,noise[c],noise[c+1])
+                c += 2 #Advance the noise pointer
+            x = self.to_final_shape(x)
+        else:
+            raise NotImplementedError()
+
+        return x
+
+
+
 
 
 class StyleGANGenerator(nn.Module):
