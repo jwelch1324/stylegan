@@ -27,16 +27,20 @@ class ModelLog():
 
 
 def pixel_norm(x,epsilon=1e-8):
-    rsqx = 1.0/torch.sqrt(torch.mean(torch.pow(x,2),dim=1,keepdims=True) + epsilon)
-    return (x*rsqx)
+    org_type = x.dtype
+    x = x.to(torch.float32)
+    rsqx = 1.0/torch.sqrt(torch.mean(x*x,dim=1,keepdims=True) + torch.tensor(epsilon).to(x.dtype))
+    x = (x*rsqx).to(org_type)
+    return x
 
 def instance_norm(x, epsilon=1e-8):
     orig_dtype = x.dtype
     x = x.to(torch.float32)
     x -= x.mean(dim=(2,3), keepdim=True)
     epsilon = torch.tensor(epsilon).to(x.dtype)
-    rsqx = 1.0/torch.sqrt(torch.mean(torch.pow(x,2.0),dim=(2,3),keepdim=True)+epsilon)
-    x *= rsqx
+    rsqx = 1.0/torch.sqrt(torch.mean(x*x,dim=(2,3),keepdim=True)+epsilon)
+    #rsqx = 1
+    x = x*rsqx
     x = x.to(orig_dtype)
     return x
 
@@ -83,14 +87,15 @@ class Dense(nn.Module):
         out_channels,
         use_wscale = False,
         gain = np.sqrt(2),
-        lrmul = 1
+        lrmul = 1,
+        dtype = torch.float32
     ):
         super().__init__()
 
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.use_wscale = use_wscale
-        self.lrmul = lrmul
+        self.lrmul = torch.tensor(lrmul).to(dtype)
 
         fan_in = in_channels*out_channels
         he_std = gain/np.sqrt(fan_in)
@@ -102,8 +107,34 @@ class Dense(nn.Module):
             init_std = he_std/lrmul
             self.runtime_coeff = lrmul
 
-        self.weight = nn.init.normal_(nn.Parameter(torch.zeros(self.in_channels,self.out_channels)),0,init_std)
-        self.bias = nn.Parameter(torch.zeros(self.out_channels))
+        self.runtime_coeff = torch.tensor(self.runtime_coeff).to(dtype)
+
+        if dtype == torch.float32:
+            self.weight = nn.init.normal_(nn.Parameter(torch.zeros(self.in_channels,self.out_channels)),0,init_std).to(dtype)
+        else:
+            self.weight = nn.init.kaiming_normal_(nn.Parameter(torch.zeros(self.in_channels,self.out_channels))).to(dtype)
+        self.bias = nn.Parameter(torch.zeros(self.out_channels)).to(dtype)
+
+    def cuda(self):
+#        print("Dense cuda()")
+        def to_cuda(x):
+            for child in x.children():
+                to_cuda(child)
+                child.cuda()
+        to_cuda(self)
+        self.weight = nn.Parameter(self.weight.cuda())
+        self.bias = nn.Parameter(self.bias.cuda())
+        return self
+
+    def cpu(self):
+        def to_cpu(x):
+            for child in x.children():
+                to_cpu(child)
+                child.cpu()
+        to_cpu(self)
+        self.weight = nn.Parameter(self.weight.cpu())
+        self.bias = nn.Parameter(self.weight.cpu())
+        return self
 
     def forward(self, x):
         if len(x.shape) > 2:
@@ -123,7 +154,7 @@ class LatentDisentanglingNetwork(nn.Module):
         mapping_lrmul       = 0.01,      # Learning Rate Multiplier for the mapping layers
         mapping_actfunc     = 'lrelu',   # Activation Function
         normalize_latents   = True,      # Normalize the Latent vectors before running through the network?
-        dtype               = 'float32', # Data type to use for all activations and inputs  
+        dtype               = torch.float32, # Data type to use for all activations and inputs  
         **_kwargs                        # Ignore all unknown keywords   
     ):
         super().__init__()
@@ -141,7 +172,9 @@ class LatentDisentanglingNetwork(nn.Module):
 
         #If we have labels then we need to embed them an concat them onto the latent vectors
         if self.label_size > 0:
-            self.label_embedding = nn.init.kaiming_normal_(nn.Parameter(torch.zeros(self.label_size,self.latent_size)))
+            self.label_embedding = nn.init.kaiming_normal_(nn.Parameter(torch.zeros(self.label_size,self.latent_size).to(dtype)))
+        else:
+            self.label_embedding = None
         
         map_layers = []
 
@@ -149,11 +182,32 @@ class LatentDisentanglingNetwork(nn.Module):
         curr_dim = self.latent_size
         for layer_idx in range(self.mapping_layers):
             hidden_dim = self.dlatent_size if layer_idx == self.mapping_layers -1 else self.mapping_hdim
-            map_layers.append(Dense(curr_dim,hidden_dim))
+            map_layers.append(Dense(curr_dim, hidden_dim, dtype=dtype))
             map_layers.append(self.act)
             curr_dim = hidden_dim
 
         self.main = nn.Sequential(*map_layers)
+
+    def cuda(self):
+       # print("Latent Disentanglment Network cuda()")
+        def to_cuda(x):
+            for child in x.children():
+                to_cuda(child)
+                child.cuda()
+        to_cuda(self)
+        if self.label_embedding is not None:
+            self.label_embedding = nn.Parameter(self.label_embedding.cuda())
+        return self
+
+    def cpu(self):
+        def to_cpu(x):
+            for child in x.children():
+                to_cpu(child)
+                child.cpu()
+        to_cpu(self)
+        if self.label_embedding is not None:
+            self.label_embedding = nn.Parameter(self.label_embedding.cuda())
+        return self
 
     def embed_and_concat_label(self, z, label):
         """ Embeds the one-hot label into the latent-space and then concats it as an additional channel to the latent vectors """
@@ -166,7 +220,8 @@ class LatentDisentanglingNetwork(nn.Module):
             z = self.embed_and_concat_label(z,labels)
 
         if self.normalize_latents:
-            z = pixel_norm(z)
+            pass
+            #z = pixel_norm(z)
 
         #Transform to W space
         z = self.main(z)
@@ -186,31 +241,58 @@ class LayerEpilog(nn.Module):
         activation,
         use_pixel_norm,
         use_instance_norm,
-        use_styles
+        use_styles,
+        dtype = torch.float32
     ):
         super().__init__()
 
         self.act = {'relu': nn.ReLU(), 'lrelu': nn.LeakyReLU(0.01)}[activation]
-        self.bias = nn.Parameter(torch.zeros(fmap_dim))
-        self.noise_scaling_factors = nn.Parameter(torch.zeros(fmap_dim))# These are the learned feature wise noise scaling parameters
+        self.bias = nn.Parameter(torch.zeros(fmap_dim)).to(dtype)
+        self.noise_scaling_factors = nn.Parameter(torch.zeros(fmap_dim)).to(dtype)# These are the learned feature wise noise scaling parameters
         self.use_pixel_norm = use_pixel_norm
         self.use_instance_norm = use_instance_norm
         self.use_styles = use_styles
-        self.lrmul = lrmul
+        self.lrmul = torch.tensor(lrmul).to(dtype)
 
         if self.use_styles:
-            self.style_mod_layer = LayerStyleMod(dlatent_dim, fmap_dim)
+            self.style_mod_layer = LayerStyleMod(dlatent_dim, fmap_dim, dtype=dtype)
         else:
             self.style_mod_layer = None
+
+        self.instancenorm = nn.InstanceNorm2d(fmap_dim).to(dtype)
+
+    def cuda(self):
+       # print("LayerEpilog cuda()")
+        def to_cuda(x):
+            for child in x.children():
+                to_cuda(child)
+                child.cuda()
+        to_cuda(self)
+        self.lrmul = self.lrmul.cuda()
+        self.bias = nn.Parameter(self.bias.cuda())
+        self.noise_scaling_factors = nn.Parameter(self.noise_scaling_factors.cuda())
+        self.instancenorm = self.instancenorm.cuda()
+        return self
+
+    def cpu(self):
+        def to_cpu(x):
+            for child in x.children():
+                to_cpu(child)
+                child.cpu()
+        to_cpu(self)
+        self.lrmul = self.lrmul.cpu()
+        self.bias = nn.Parameter(self.bias.cpu())
+        self.noise_scaling_factors = nn.Parameter(self.noise_scaling_factors.cpu())
+        return self
 
     def forward(self, x, dlatent, use_noise, noise=None):
         if use_noise:
             if noise is None:
-                noise = torch.randn((x.shape[0], 1, x.shape[2], x.shape[3]),dtype=x.dtype).to(x.device)#2d
+                noise = torch.randn((x.shape[0], 1, x.shape[2], x.shape[3])).to(x.dtype).to(x.device)#2d
             else:
                 noise = noise.to(x.dtype).to(x.device)
             # Add the noise with the channel wise scaling
-            x = x + noise * self.noise_scaling_factors.reshape(1,-1,1,1).to(x.dtype)#2d
+            x = x + noise * (self.noise_scaling_factors.reshape(1,-1,1,1).to(x.dtype).to(x.device))#2d
         
         #Apply the bias
         if len(x.shape) == 2:
@@ -224,7 +306,7 @@ class LayerEpilog(nn.Module):
         if self.use_pixel_norm:
             x = pixel_norm(x)
         if self.use_instance_norm:
-            x = instance_norm(x)
+            x = self.instancenorm(x)
         if self.use_styles:
             x = self.style_mod_layer(x, dlatent)
             
@@ -234,18 +316,23 @@ class LayerStyleMod(nn.Module):
     def __init__(self,
         dlatent_dim, #Dimensionality of the dlatent space
         layer_fmaps, #The number of feature maps for the layer this style is applied on
+        dtype=torch.float32
     ):
         super().__init__()
 
-        self.dense = Dense(dlatent_dim,2*layer_fmaps,gain=1)
+        self.dense = Dense(dlatent_dim,2*layer_fmaps,gain=1,dtype=dtype)
+
+    def cuda(self):
+       # print("LayerStyleMod cuda()")
+        super().cuda()
+        self.dense = self.dense.cuda()
+        return self
 
     def forward(self, x, dlatent):
         style = self.dense(dlatent)
         style = style.reshape([-1,2,x.shape[1]] + [1] * (len(x.shape) -2))
         # Apply the adaptive instance norm transform -- x should have been instance normed prior to this
         return x*(style[:,0] + 1) + style[:,1]
-
-
 
 
 class Block(nn.Module):
@@ -256,7 +343,8 @@ class Block(nn.Module):
         activation,
         use_pixel_norm,
         use_instance_norm,
-        use_styles
+        use_styles,
+        dtype = torch.float32
     ):
         super().__init__()
         def nf(stage): return min(int(fmaps_base/(2.0**(stage*1.0))),512)
@@ -273,7 +361,8 @@ class Block(nn.Module):
                 activation,
                 use_pixel_norm,
                 use_instance_norm,
-                use_styles
+                use_styles,
+                dtype = dtype
             ),
             LayerEpilog(
                 nf(self.block_resolution-1),
@@ -282,7 +371,8 @@ class Block(nn.Module):
                 activation,
                 use_pixel_norm,
                 use_instance_norm,
-                use_styles
+                use_styles,
+                dtype = dtype
             )
         ])
 
@@ -294,7 +384,7 @@ class Block(nn.Module):
             padding = 1,
             output_padding = 1,
             bias=False #The bias term is handled in the Layer Epilogs
-        )
+        ).to(dtype)
 
         self.out_conv = nn.Conv2d(
             in_channels = nf(self.block_resolution-1),
@@ -303,10 +393,19 @@ class Block(nn.Module):
             stride = 1,
             padding = calc_padding(2**self.block_resolution, 2**self.block_resolution,1,3,1),
             bias=False #The bias term is handled in the LayerEpilog
-        )
+        ).to(dtype)
 
         #The gaussian blur that is applied after the upscale to help mitigate checkerboard effects
-        self.blur_layer = blur_2d_layer(3,1,nf(self.block_resolution-1))
+        self.blur_layer = blur_2d_layer(3,1,nf(self.block_resolution-1)).to(dtype)
+    
+    def cuda(self):
+        #print("Block cuda()")
+        def to_cuda(x):
+            for child in x.children():
+                to_cuda(child)
+                child.cuda()
+        to_cuda(self)
+        return self
 
     def forward(self, x, dlatent, use_noise, noise0=None, noise1=None):
         # Upscale and blur the sample
@@ -366,10 +465,11 @@ class StyleGANSynthesizer(nn.Module):
         self.fused_scale = fused_scale
         self.blur_filter = blur_filter
         self.tensor_dtype = dtype
+        self.dlatent_dim = dlatent_dim
 
         self.contexts = resolution_log2 + 1 - 3
 
-        self.const_tensor = nn.Parameter(torch.ones(1,nf(1),4,4)) #The learned starting const tensor
+        self.const_tensor = nn.Parameter(torch.ones(1,nf(1),4,4)).to(dtype) #The learned starting const tensor
 
         # Early Layers
         self.const_layer_epilog = LayerEpilog(
@@ -379,7 +479,8 @@ class StyleGANSynthesizer(nn.Module):
                 activation,
                 use_pixel_norm,
                 use_instance_norm,
-                use_styles
+                use_styles,
+                dtype=dtype
         )            
         self.conv_4x4 = nn.Conv2d(
             nf(1),
@@ -388,7 +489,8 @@ class StyleGANSynthesizer(nn.Module):
             stride = 1,
             padding = calc_padding(4,4,1,3,1),
             bias = False
-        )
+        ).to(dtype)
+
         self.conv_4x4_epilog = LayerEpilog(
             nf(1),
             dlatent_dim,
@@ -396,7 +498,8 @@ class StyleGANSynthesizer(nn.Module):
             activation,
             use_pixel_norm,
             use_instance_norm,
-            use_styles
+            use_styles,
+            dtype=dtype
         )
 
         blocks = []
@@ -409,7 +512,8 @@ class StyleGANSynthesizer(nn.Module):
                     activation = activation,
                     use_pixel_norm = self.use_pixel_norm,
                     use_instance_norm = self.use_instance_norm,
-                    use_styles = self.use_styles
+                    use_styles = self.use_styles,
+                    dtype=dtype
                 ))
 
             self.body = nn.ModuleList(blocks)
@@ -420,10 +524,27 @@ class StyleGANSynthesizer(nn.Module):
                 kernel_size=1,
                 stride=1,
                 padding=0
-            )
+            ).to(dtype)
         else:
             raise NotImplementedError()
-        
+
+    def cuda(self):
+        def to_cuda(x):
+            for child in x.children():
+                to_cuda(child)
+                child.cuda()
+        to_cuda(self)
+        self.const_tensor = nn.Parameter(self.const_tensor.cuda())
+        return self
+
+    def cpu(self):
+        def to_cpu(x):
+            for child in x.children():
+                to_cpu(child)
+                child.cpu()
+        to_cpu(self)
+        self.const_tensor = nn.Parameter(self.const_tensor.cpu())
+        return self
 
     def forward(self, w_latents, noise=None):
         #w_latents should have shape [B,num_layers,dlatent_dim]
@@ -440,7 +561,7 @@ class StyleGANSynthesizer(nn.Module):
             #Apply the main body of the network
             c = 2
             for block in self.body:
-                print(c)
+                #print(c)
                 x = block(x,w_latents[:,c],self.use_noise,noise[c],noise[c+1])
                 c += 2 #Advance the noise pointer
             x = self.to_final_shape(x)
@@ -455,11 +576,78 @@ class StyleGANSynthesizer(nn.Module):
 
 class StyleGANGenerator(nn.Module):
     def __init__(self,
-        sample_shape = (128,128,3),     # Input Shape of the Signal
-        noise_latent_dim = 512,         # Dimensionality of the latent noise space
-        num_channels = 3,               # Number of signal channels
+        output_resolution = 256, # The final output resolution of the generated image -- must use a power of two
+        latent_space_dim = 512, # Dimension of the Latent Manifold
+        label_size = 0, # Dimensionality of the labels, 0 if None
+        dlatent_dim = 512, # Dimensionality of the disentangled latent noise space W
+        num_channels = 3,  # Number of output channels for the generated signal
+        fmap_base = 8192, # Multiplier for the number of feature maps
+        fmap_decay = 1.0, # log2 feature map reduction when doubling the resolution
+        fmap_max = 512, # Maximum number of feature maps allowed in any layer.
+        use_styles = True, # Enable the Style Inputs?
+        const_input_layer = True, # Is the first layer of the generator a learned constant?
+        use_noise = True, # Enable noise inputs?
+        randomize_noise = True, # True = Randomize Noise inputs every time, False = read noise inputs from variables
+        activation = 'lrelu', # Activation function, can be 'relu' or 'lrelu'
+        use_wscale = True, # Enabled the Equalized Learning Rate?
+        use_pixel_norm = False, # Enable pixelwise feature vector normalization?
+        use_instance_norm = True, # Enable Instance Normalization?
+        dtype = torch.float32,
+        fused_scale = 'auto', # True = fused convolution + scaling, False = separate ops, 'auto' = decide automatically
+        blur_filter = [1,2,1], # Low-pass filter to apply when resampling, None = no filtering
+        structure = 'auto', # 'fixed' = no progressive growing, 'linear' = human-readable, 'recursive' = efficient, 'auto' = select automatically,
+        **_kwargs
     ):
-        pass
+        super().__init__()
+        self.synthesizer = StyleGANSynthesizer(
+            output_resolution = output_resolution,
+            dlatent_dim = dlatent_dim,
+            num_channels = num_channels,
+            fmap_base = fmap_base,
+            fmap_decay = fmap_decay,
+            fmap_max = fmap_max,
+            use_styles = use_styles,
+            const_input_layer = const_input_layer,
+            use_noise = use_noise,
+            randomize_noise = randomize_noise,
+            activation=activation,
+            use_wscale = use_wscale,
+            use_pixel_norm = use_pixel_norm,
+            use_instance_norm = use_instance_norm,
+            dtype = dtype,
+            fused_scale = fused_scale,
+            blur_filter = blur_filter,
+            structure = structure
+        )
+
+        self.mapping_network = LatentDisentanglingNetwork(
+            latent_size = latent_space_dim,
+            label_size = label_size,
+            dlatent_size = dlatent_dim,
+            dlatent_broadcast = self.synthesizer.num_layers,
+            mapping_layers = 8,
+            mapping_hdim = 512,
+            mapping_lrmul = 0.01,
+            mapping_actfunc = 'lrelu',
+            normalize_latents = True,
+            dtype = dtype
+        )
+
+    def cuda(self):
+        self.synthesizer = self.synthesizer.cuda()
+        self.mapping_network = self.mapping_network.cuda()
+        return self
+
+    def cpu(self):
+        self.synthesizer = self.synthesizer.cpu()
+        self.mapping_network = self.mapping_network.cpu()
+        return self
+
+    def forward(self, z_latents, labels=None, noise=None):
+        dlatents = self.mapping_network(z_latents,labels)
+        return self.synthesizer(dlatents,noise)
+
+
 
 class Generator(nn.Module):
     def __init__(self, conv_dim=64, sample_shape = (128,128,3), noise_shape=(1,100)):
@@ -807,22 +995,22 @@ class Generator2(nn.Module):
 
 class Discriminator(nn.Module):
     """Discriminator network with PatchGAN."""
-    def __init__(self, input_channels=3, image_size=128, conv_dim=64, repeat_num=6):
+    def __init__(self, input_channels=3, image_size=128, conv_dim=64, repeat_num=6, dtype=torch.float32):
         super().__init__()
         layers = []
-        layers.append(nn.Conv2d(input_channels, conv_dim, kernel_size=4, stride=2, padding=1))
-        layers.append(nn.LeakyReLU(0.01))
+        layers.append(nn.Conv2d(input_channels, conv_dim, kernel_size=4, stride=2, padding=1).to(dtype))
+        layers.append(nn.LeakyReLU(0.01).to(dtype))
 
         curr_dim = conv_dim
         for i in range(1, repeat_num):
-            layers.append(nn.Conv2d(curr_dim, curr_dim*2, kernel_size=4, stride=2, padding=1))
-            layers.append(nn.LeakyReLU(0.01))
+            layers.append(nn.Conv2d(curr_dim, curr_dim*2, kernel_size=4, stride=2, padding=1).to(dtype))
+            layers.append(nn.LeakyReLU(0.01).to(dtype))
             curr_dim = curr_dim * 2
 
         kernel_size = int(image_size / np.power(2, repeat_num))
         self.input_channels = input_channels
         self.main = nn.Sequential(*layers)
-        self.conv1 = nn.Conv2d(curr_dim, 1, kernel_size=3, stride=1, padding=1, bias=False)
+        self.conv1 = nn.Conv2d(curr_dim, 1, kernel_size=3, stride=1, padding=1, bias=False).to(dtype)
         self.channel_first_swap = Rearrange('b w h c -> b c w h')
         #self.conv2 = nn.Conv2d(curr_dim, c_dim, kernel_size=kernel_size, bias=False)
         
@@ -835,6 +1023,256 @@ class Discriminator(nn.Module):
         out_src = self.conv1(h)
         #out_cls = self.conv2(h)
         return out_src #, out_cls.view(out_cls.size(0), out_cls.size(1))
+
+
+class StyleGANSolver():
+    def __init__(self,
+        data_loader:torch.utils.data.DataLoader,
+        config, #Dictionary of Configuration parameters for the Model
+        dtype=torch.float32
+    ):
+        self.data_loader = data_loader
+        self.config = config
+        self.log = ModelLog()
+        self.fixed_noise = None
+        self.fixed_src = None
+        self.tensor_dtype=dtype
+
+        self.lambda_gp = self.config['lambda_gp']
+
+
+        #Setup the Generator and Discriminators
+        self.G = StyleGANGenerator(
+            output_resolution = 512,
+            dtype=dtype
+        )
+
+        self.D = Discriminator(
+            input_channels= config['sample_shape'][2],
+            image_size = config['sample_shape'][1],
+            conv_dim = config['conv_dim'],
+            dtype=dtype         
+        )
+
+        self.channel_swap = Rearrange('b c h w -> b h w c')
+
+        self.optG = self.optD = None
+        if self.config['opt_type'].upper() == "ADAM":
+            self.optG = torch.optim.Adam(self.G.parameters(), self.config['lrG'], [self.config['beta1G'],self.config['beta2G']])
+            self.optD = torch.optim.Adam(self.D.parameters(), self.config['lrD'], [self.config['beta1D'],self.config['beta2D']])
+        elif self.config['opt_type'].upper() == "RMSPROP":
+            self.optG = torch.optim.RMSprop(self.G.parameters(), self.config['lrG'],weight_decay=self.config['weight_decay_G'])
+            self.optD = torch.optim.RMSprop(self.D.parameters(), self.config['lrD'],weight_decay=self.config['weight_decay_D'])
+        else:
+            assert False, "The specified optimizer type isn't supported yet!"
+
+    def save_state(self, out_path):
+        torch.save({
+            'G_weights':self.G.state_dict(),
+            'D_weights':self.D.state_dict(),
+            'optG_weights':self.optG.state_dict(),
+            'optD_weights':self.optD.state_dict(),
+            'config':self.config,
+            'log':self.log,
+            'fixed_noise':[self.fixed_noise[0].cpu(),self.fixed_noise[1].cpu()],
+            'fixed_src':self.fixed_src.cpu(),
+        }, out_path)
+
+    @staticmethod
+    def load(state_data_path, data_loader):
+        state_data = torch.load(state_data_path)
+        sgs = PatchGANSolver2(data_loader,state_data['config'].copy())
+        sgs.load_state(state_data_path, data_loader)
+        del state_data
+        return sgs
+
+    def load_state(self, state_data_path, data_loader, keep_config=False):
+        state_data = torch.load(state_data_path)
+        self.G.load_state_dict(state_data['G_weights'])
+        self.D.load_state_dict(state_data['D_weights'])
+        self.optG.load_state_dict(state_data['optG_weights'])
+        self.optD.load_state_dict(state_data['optD_weights'])
+        self.data_loader = data_loader
+        if keep_config:
+            self.config = state_data['config']
+        self.log = state_data['log']
+        self.fixed_noise = state_data['fixed_noise']
+        self.fixed_src = state_data['fixed_src']
+
+    def cuda(self):
+        self.G = self.G.cuda()
+        self.D = self.D.cuda()
+        self.channel_swap = self.channel_swap.cuda()
+        return self
+
+    def cpu(self):
+        self.G = self.G.cpu()
+        self.D = self.D.cpu()
+        self.channel_swap = self.channel_swap.cpu()
+        return self
+    
+    def update_lr(self, g_lr, d_lr):
+        """Decay learning rates of the generator and discriminator."""
+        for param_group in self.optG.param_groups:
+            param_group['lr'] = g_lr
+        for param_group in self.optD.param_groups:
+            param_group['lr'] = d_lr
+
+    def reset_grad(self):
+        """Reset the gradient buffers."""
+        self.optG.zero_grad()
+        self.optD.zero_grad()
+
+    def label2onehot(self, labels, dim):
+        """Convert label indices to one-hot vectors."""
+        batch_size = labels.size(0)
+        out = torch.zeros(batch_size, dim)
+        out[np.arange(batch_size), labels.long()] = 1
+        return out
+
+    def remove_magnitude_channels(self,x):
+        return torch.cat([x[:,0:3],x[:,4:7]],dim=1)
+
+    def join_signals(self,xi,xj):
+        xr = None
+        if self.config['random_pair_order']:
+            if random.uniform(0,1) > 0.5:
+                xr = torch.cat([xi,xj],dim=1) #[B , ch*2, seq_length]
+            else:
+                xr = torch.cat([xj,xi],dim=1) #[B , ch*2, seq_length]
+        else:
+            xr = torch.cat([xi,xj],dim=1) #[B , ch*2, seq_length]
+
+        return xr
+
+    def gradient_penalty(self, y, x):
+        """Compute gradient penalty: (L2_norm(dy/dx) - 1)**2."""
+        weight = torch.ones(y.size()).to(y.device)
+        dydx = torch.autograd.grad(outputs=y,
+                                   inputs=x,
+                                   grad_outputs=weight,
+                                   retain_graph=True,
+                                   create_graph=True,
+                                   only_inputs=True)[0]
+
+        dydx = dydx.view(dydx.size(0), -1)
+        dydx_l2norm = torch.sqrt(torch.sum(dydx**2, dim=1))
+        return torch.mean((dydx_l2norm-1)**2)
+
+    def train(self):
+
+        if os.path.isdir(self.config['outdir']):
+            #Determine where we have already trained up to
+            import glob
+            mfiles = glob.glob(self.config['outdir']+"/model*")
+            if len(mfiles) > 0:
+                mfile, trained_epoch, trained_step = sorted(list(map(lambda x: (x[0],int(x[1][-2]),int(x[1][-1].split('.')[0])), map(lambda x: (x,x.split('_')),mfiles))),key=lambda x: (x[1],x[2]))[::-1][0]
+                
+                self.load_state(mfile,self.data_loader)
+                
+                if trained_step == 0:
+                    trained_step = -1
+        else:
+            os.makedirs(self.config['outdir'])
+            mfile = ""
+            trained_epoch = 0
+            trained_step = -1
+
+        for epoch in range(self.config['n_epochs']):
+            if epoch < int(trained_epoch):
+                print(f"Trained Epoch {epoch}...Skipping")
+                continue
+            print(f"Starting Epoch {epoch}")
+            if trained_step > 0:
+                print(f"Fast forwarding to step {trained_step}")
+            for i, data in tqdm(enumerate(self.data_loader),total=len(self.data_loader)):
+                
+                if (trained_step > 0) and (i < trained_step):
+                    #Skip forward in time
+                    continue
+                trained_step = 0 #We set this to zero so that on the next epoch it doesn't attempt to fast forward again
+
+                xi = data
+                xi = xi.to(self.tensor_dtype).cuda()
+                
+                # =================================================================================== #
+                #                                Train the discriminator                              #
+                # =================================================================================== # 
+                self.reset_grad()
+                #Compute the Loss with Real Signals
+                out_src = self.D(xi)
+
+                d_loss_real = -torch.mean(out_src)
+
+                #Compute the Loss with Fake Signals
+                #Sample the latent vectors for this round
+                latents = torch.randn((xi.shape[0],self.config['latent_dim'])).to(self.tensor_dtype).cuda()
+                x_fake = self.G(latents)
+                out_src = self.D(x_fake)
+                d_loss_fake = torch.mean(out_src)
+
+                #Compute loss for gradient penalty
+                alpha = torch.rand(xi.size(0),1,1,1).to(xi.device)
+                x_hat = (alpha*xi.data + (1 - alpha)*self.channel_swap(x_fake).data).requires_grad_(True).to(xi.dtype).to(xi.device)
+                out_src = self.D(x_hat)
+                d_loss_gp = self.gradient_penalty(out_src, x_hat)
+
+                #Backward and Optimize
+                d_loss = d_loss_real + d_loss_fake + self.lambda_gp * d_loss_gp
+                d_loss.backward()
+                self.optD.step()
+
+                #Log the losses
+                self.log['D/loss_real'].append(d_loss_real.item())
+                self.log['D/loss_fake'].append(d_loss_fake.item())
+                self.log['D/loss_gp'].append(d_loss_gp.item())
+
+
+                # =================================================================================== #
+                #                                Train the generator                                  #
+                # =================================================================================== # 
+                self.reset_grad()
+                if i % self.config['n_critic'] == 0:
+                    latents = torch.randn((xi.shape[0],self.config['latent_dim'])).to(self.tensor_dtype).cuda()
+                    x_fake = self.G(latents)
+                    out_src = self.D(x_fake)
+                    g_loss_fake = -torch.mean(out_src)
+
+                    #Backward and Optimize
+                    g_loss = g_loss_fake
+                    g_loss.backward()
+                    self.optG.step()
+
+                    #Log the losses
+                    self.log['G/loss_fake'].append(g_loss_fake.item())
+                else:
+                    self.log['G/loss_fake'].append(self.log['G/loss_fake'][-1])          
+
+                # Output training stats
+                if i % self.config['state_update_every'] == 0:
+                    print('[%d/%d][%d/%d]--\n\tLoss_D: R:%.4f F:%.4f GP:%.4f\n\tLoss_G: F:%.4f' % (
+                        epoch, 
+                        self.config['n_epochs'], 
+                        i, 
+                        len(self.data_loader), 
+                        self.log['D/loss_real'][-1],
+                        self.log['D/loss_fake'][-1],
+                        self.log['D/loss_gp'][-1], 
+                        self.log['G/loss_fake'][-1]))
+
+            if epoch % self.config['save_every'] == 0:
+                with torch.no_grad():
+                    fake_out = []
+                    for fake in self.fixed_noise:
+                        fake_out.append(self.G(fake.unsqueeze(0).cuda()).unsqueeze(0).detach().cpu())
+                    #s_fake = self.G(self.fixed_noise.cuda()).cpu().detach()
+                    s_fake = torch.cat(fake_out,dim=0).cpu()
+                    torch.save((self.fixed_src.cpu(),s_fake.cpu()),f"{self.config['outdir']}/fake_{epoch}_{i}.pkl")
+                    self.save_state(f"{self.config['outdir']}/model_weights_{epoch}_{i}.pkl")
+            
+            if 'archive_every' in self.config:
+                if epoch % self.config['archive_every'] == 0:
+                    pass #Launch the archive script here...
 
 class PatchGANSolver2():
     def __init__(self,

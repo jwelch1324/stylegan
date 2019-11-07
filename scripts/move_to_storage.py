@@ -24,7 +24,7 @@ from tqdm import tqdm
 # In[63]:
 
 
-config = {'outdir':'/home/jwelch/Code/menrva/notebooks/ArtGAN_1'}
+config = {'outdir':'/home/jwelch/Code/menrva/notebooks/ArtGAN_4'}
 
 
 # In[64]:
@@ -64,15 +64,15 @@ print(files)
 # In[59]:
 
 
-if not os.path.isdir('/data/cold_storage/ArtGAN_1'):
-    os.makedirs('/data/cold_storage/ArtGAN_1')
+if not os.path.isdir('/data/cold_storage/ArtGAN_4'):
+    os.makedirs('/data/cold_storage/ArtGAN_4')
 
 
 # In[60]:
 
 
 for f in tqdm(files):
-    shutil.move(f,os.path.join('/data/cold_storage/ArtGAN_1/',os.path.basename(f)))
+    shutil.move(f,os.path.join('/data/cold_storage/ArtGAN_4/',os.path.basename(f)))
 
 
 # In[ ]:

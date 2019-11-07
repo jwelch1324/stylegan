@@ -29,6 +29,9 @@ class ImagePatchDatabase(torch.utils.data.Dataset):
 
         for i in tqdm(imgs):
             img = imageio.imread(i)
+            if (img.shape[0] < self.patch_height) or (img.shape[1] < self.patch_width):
+                print("Source image is too small to divide up into patches! Skipping")
+                continue
             self.imagepatchdatasets.append(ImagePatchDataset(img,self.patch_width,self.patch_height))
 
         for i in range(len(self.imagepatchdatasets)):
